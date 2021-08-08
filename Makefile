@@ -2,8 +2,8 @@
 .PHONY:all clean
 SHELL = /bin/bash
 LIBS= -lusb-1.0
-CFLAGS=-O0 -g3 -march=native
-#CFLAGS=-g0 -O3 -march=native -fomit-frame-pointer -DNDEBUG
+#CFLAGS=-O0 -g3 -march=native
+CFLAGS=-g0 -O3 -march=native -fomit-frame-pointer -DNDEBUG
 
 all: accuchek
 	@echo done.

@@ -15,11 +15,11 @@ blood glucose monitor using libusb
 
 ## **To run:**
 
-+ in a shell, type:
++ in a root shell, type:
 
     `./accuchek > samples.json`
 
-+ blood glucose levels are in file samples.json
++ blood glucose levels should be in file samples.json
 
 ## **What it does:**
 
@@ -55,7 +55,7 @@ blood glucose monitor using libusb
 + The JS code has a little more functionality (eg it can set the device
   time), but as much as I can ascertain, it's not particularly portable:
   it only runs on top of Chrome, and even there, I have never really
-  managed to get it to run on anything but windoze: the amount of depenencies
+  managed to get it to run on anything but windoze: the amount of dependencies
   you have to install to ever hope to see it run is simply frightening.
 
 + A number of things might go wrong with this code. When that happens:
