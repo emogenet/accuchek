@@ -2,7 +2,7 @@
 
 ## **TL;DR:**
 
-Linux C++-17 code to download samples from a Roche Accu-Chek Guide
+Linux C++-17 code to download samples from a "ROCHE ACCU-CHEK Guide"
 blood glucose monitor using libusb
 
 ## **To compile:**
@@ -15,11 +15,13 @@ blood glucose monitor using libusb
 
 ## **To run:**
 
++ connect your device via USB to your computer
 + in a root shell, type:
 
     `./accuchek > samples.json`
 
 + blood glucose levels should be in file samples.json
++ if it didn't work see "a number of things can go wrong" below
 
 ## **What it does:**
 
@@ -32,7 +34,12 @@ blood glucose monitor using libusb
 
 ## **Of interest:**
 
-+ This has been tested on Ubuntu 20.04. On other *nixes, YMMV.
++ This has been tested on Ubuntu 20.04. On other Unixes, YMMV.
+
++ The file config.txt contains the USB id's of supported devices.
+  If you have a slightly difference device that may work with this
+  code, add its parameters (found in the output of lsusb) to the
+  file and see if it works. Please submit a PR of it does.
 
 + This is a rough first cut, improvements via PRs are welcome.
 

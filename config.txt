@@ -1,0 +1,2 @@
+vendor_0x173a_device_0x21d5 1 # roche accu-Chek model  929
+vendor_0x173a_device_0x21d7 1 # some other similar model with product id 0x21d7 that should also work with this code

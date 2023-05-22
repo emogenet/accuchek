@@ -21,10 +21,17 @@
 #include <unistd.h>
 #include <algorithm>
 #include <inttypes.h>
-#include <unordered_set>
+#include <unordered_map>
 #include <libusb-1.0/libusb.h>
 
+// config key value pair map
+using Config = std::unordered_map<
+    std::string,
+    std::string
+>;
+
 // globals
+static Config g_config;
 static FILE *g_output = 0;
 static auto g_lineCount = 0;
 static auto g_firstLine = true;
@@ -165,6 +172,67 @@ enum MDC_ENUM {
         MDC_LIST
     #undef x
 };
+
+// load config file
+static auto loadConfig() {
+auto fp = fopen("config.txt", "r");
+  if(0!=fp) {
+    size_t len = 0;
+    char *line = 0;
+    while(1) {
+
+      auto nbRead = getline(&line, &len, fp);
+      if(nbRead<0) {
+        break;
+      }
+      if(0==nbRead) {
+        continue;
+      }
+
+      auto p = line;
+      char *firstSep = 0;
+      char *secondSep = 0;
+      char *secondFirst = 0;
+      auto end = (nbRead + p);
+      while(p<end) {
+        auto c = p[0];
+        auto validChar = (
+          ('0'<=c && c<='9')  ||
+          ('A'<=c && c<='Z')  ||
+          ('a'<=c && c<='z')  ||
+          ('_'==c)
+        );
+        if(false==validChar) {
+          if(0==firstSep) {
+            firstSep = p;
+          } else {
+            if(0==secondSep && 0!=secondFirst) {
+              secondSep = p;
+            }
+          }
+        } else {
+          if(0!=firstSep) {
+            if(0==secondFirst) {
+              secondFirst = p;
+            }
+          }
+        }
+        ++p;
+      }
+      if(0==firstSep || 0==secondFirst || 0==secondSep) {
+        continue;
+      }
+
+      auto key = std::string(line, firstSep);
+      auto val = std::string(secondFirst, secondSep);
+      g_config[key] = val;
+    }
+    if(0!=line) {
+      free(line);
+    }
+    fclose(fp);
+  }
+}
 
 // get the name of a specific MDC_* constant as a string
 static auto findKeyByValue(
@@ -1346,12 +1414,30 @@ static auto addDeviceIfAccuChek(
             break;
         }
 
-        // vendorId should be : 0x173a : Roche
-        // productId should be: 0x21d5 : ACCU-CHEK Guide
-        if(
-            (0x21d5==dsc.idProduct) &&
-            (0x173a==dsc.idVendor)
+        auto isKeyValid = [&](
+          const std::string &key
         ) {
+            static const auto valid = std::string("1");
+            return (0!=g_config.count(key) && valid==g_config[key]);
+        };
+
+        auto isDeviceValid = [&](
+          uint32_t vendorId,
+          uint32_t deviceId
+        ) {
+          char buffer[1024];
+          snprintf(
+            buffer,
+            sizeof(buffer),
+            "vendor_0x%04x_device_0x%04x",
+            vendorId,
+            deviceId
+          );
+          return isKeyValid(buffer);
+        };
+
+        // check that device and vendor is in list of known devices
+        if(isDeviceValid(dsc.idVendor, dsc.idProduct)) {
             // we have a new valid device, add it to the list
             LOG_NFO("========> found a matching USB device");
             validDevices.emplace_back(
@@ -1494,6 +1580,9 @@ int main(
     int argc,
     char *argv[]
 ) {
+
+    // load config file
+    loadConfig();
 
     // be silent unless asked to talk
     if(0!=getenv("ACCUCHEK_DBG")) {
