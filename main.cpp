@@ -1581,6 +1581,10 @@ int main(
     char *argv[]
 ) {
 
+    // must be root
+    auto euid = geteuid();
+    LOG_FTL(0!=euid, "must be root, euid is %d, bailing", euid);
+
     // load config file
     loadConfig();
 
