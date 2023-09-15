@@ -7,7 +7,7 @@ blood glucose monitor using libusb
 
 ## **To compile:**
 
-+ install libusb-1.0-dev
++ install libusb-1.0-dev (for debian in RaspberryPi , sudo apt-get install libusb-1.0-0-dev)
 + install build-essential
 + in a shell, type:
 
