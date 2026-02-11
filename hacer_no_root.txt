@@ -1,0 +1,20 @@
+# Para que corra como usuario no root hay que agregar regla de udev.
+
+# Primero se verifica el id del vendor y el product para la regla
+
+lsusb
+
+# Eso va a dar una linea como por ejemplo:
+# Bus 002 Device 073: ID 173a:21d5 Roche ACCU-CHEK Guide
+# En esa linea esta (idVendor): 173a / (idProduct): 21d5
+
+# Entonces hay que agregar la regla de udev y agregar nuestro usuario a plugdev
+
+sudo tee /etc/udev/rules.d/99-accuchek-guide.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="173a", ATTR{idProduct}=="21d5", MODE="0664", GROUP="plugdev"
+EOF
+
+sudo usermod -aG plugdev "$USER"
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+ 

@@ -10,6 +10,7 @@
 
 // stuff we need
 #include <log.h>
+#include <map>
 #include <string>
 #include <thread>
 #include <time.h>
@@ -22,6 +23,7 @@
 #include <algorithm>
 #include <inttypes.h>
 #include <unordered_map>
+#include <limits.h>
 #include <libusb-1.0/libusb.h>
 
 // config key value pair map
@@ -174,8 +176,8 @@ enum MDC_ENUM {
 };
 
 // load config file
-static auto loadConfig() {
-auto fp = fopen("config.txt", "r");
+static auto loadConfigFromPath(const char* path) {
+  auto fp = fopen(path, "r");
   if(0!=fp) {
     size_t len = 0;
     char *line = 0;
@@ -697,7 +699,8 @@ static auto operateDevice(
     // lambda to receive a message via bulk transfer
     auto bulkIn = [&](
         const char *msgName,
-        size_t maxLen = BUFFER_SIZE
+        size_t maxLen = BUFFER_SIZE,
+        bool allowTimeout = false
     ) {
         // make some noise
         printf("\n");
@@ -718,6 +721,10 @@ static auto operateDevice(
             5000                    // timeout in ms
         );
         if(0!=fail) {
+            if(allowTimeout && fail == LIBUSB_ERROR_TIMEOUT) {
+                LOG_WRN("timeout waiting for message %s -- skipping", msgName);
+                return -1;
+            }
             LOG_WRN("failed to receive message %s -- giving up", msgName);
             LOG_WRN("libusb error was :%s", libusb_strerror(fail));
             exit(1);
@@ -1084,194 +1091,364 @@ static auto operateDevice(
 
     // ----> here, the original js code sets the device time ... skip for now
 
-    // protocol step: start request for data segments
-    {
-        auto p = buffer;
-        memset(buffer, 0, sizeof(buffer));
-        be16(p, kAPDU_TYPE_PRESENTATION_APDU); // msg type
-        be16(p,     16);                       // length
-        be16(p,     14);                       // octet stringlength
-        be16(p, (1+invokeId));                 // invoke-id from prev answer
-        be16(p, kDATA_ADPU_INVOKE_CONFIRMED_ACTION);
-        be16(p,      8);                       // length of what follows (could also be zero)
-        be16(p, pmStoreHandle);                // store handle
-        be16(p, kACTION_TYPE_MDC_ACT_SEG_TRIG_XFER);
-        be16(p,      2);                       // length
-        be16(p,      0);                       // segment
+    // Global map to store tags by timestamp
+    std::map<std::string, uint8_t> globalTagMap;
 
-        bulkOut(
-            "request segments",
-            (p-buffer)
-        );
-    }
+    struct Measurement {
+        int cc;
+        int yy;
+        int mm;
+        int dd;
+        int hh;
+        int mn;
+        int vv;
+        uint16_t ss;
+        uint64_t epoch;
+    };
 
-    // step: read segment stream header answer
-    {
-        auto bytesRead = bulkIn("segment headers");
-        updateInvokeId();
+    std::vector<Measurement> measurements;
 
-        uint16_t dataResponse = 0;
-        if(22<=bytesRead) {
-            size_t o = 20;
-            dataResponse = be16r(buffer, o);
+    auto getTagDesc = [](
+        uint8_t tag
+    ) -> const char* {
+        switch(tag) {
+            case 1: return "Antes comida";
+            case 2: return "Desp. Comida";
+            case 3: return "En Ayunas";
+            case 4: return "Al acostarse";
+            case 5: return "Otro";
+            default: return "";
         }
+    };
 
-        if(22==bytesRead && 0!=dataResponse) {
-            if(3==dataResponse) {
-                LOG_WRN("empty data segment -- giving up");
-            } else {
-                LOG_NFO(
-                    "error retrieving data, code = %d",
-                    (int)dataResponse
-                );
-            }
-            exit(1);
-        }
-
-        uint16_t headerValue = -1;
-        if(16<=bytesRead) {
-            size_t o = 14;
-            headerValue = be16r(buffer, o);
-        }
-
-        if(
-            (bytesRead < 22) ||
-            (kACTION_TYPE_MDC_ACT_SEG_TRIG_XFER!=headerValue)
-        ) {
-            LOG_WRN("unexpected / incorrect answer packet -- giving up");
-            exit(1);
+    int segMax = 3;
+    if(const char* env = getenv("ACCUCHEK_SEG_MAX")) {
+        int v = atoi(env);
+        if(v >= 0) {
+            segMax = v;
         }
     }
 
-    // step: read segments one by one
-    int segIndex = 0;
-    while(true) {
+    // request segments by id (0..segMax) so we can fetch meal-tag records too
+    for(int segId = 0; segId <= segMax; ++segId) {
 
-        // get data and update invokeId
-        auto bytesRead = bulkIn("data segment");
-        auto status = buffer[32];
-        updateInvokeId();
-
-        // fish some data we need to send back in the "confirm" message
-        size_t o = 22;
-        auto u0 = be32r(buffer, o);
-        auto u1 = be32r(buffer, o);
-        auto u2 = be16r(buffer, o);
-
-        // lambda to parse samples out of each segment
-        auto parseData = [&]() {
-
-            size_t o = 30;
-            auto nbEntries = be16r(buffer, o);
-            LOG_NFO("segment has %d entries", (int)nbEntries);
-            o -= 2;
-
-            for(int i=0; i<nbEntries; ++i) {
-
-                // decode weird-ass encoding of datetime values
-                auto cvt = [](
-                    uint8_t x
-                ) {
-                    int v = -1;
-                    char buf[8];
-                    sprintf(buf, "%02X", x);
-                    sscanf(buf, "%d", &v);
-                    return v;
-                };
-
-                // load date
-                auto cc = cvt(buffer[ 6 + o]);
-                auto yy = cvt(buffer[ 7 + o]);
-                auto mm = cvt(buffer[ 8 + o]);
-                auto dd = cvt(buffer[ 9 + o]);
-                auto hh = cvt(buffer[10 + o]);
-                auto mn = cvt(buffer[11 + o]);
-
-                // load value and status
-                auto ro = (14 + o);
-                auto vv = be16r(buffer, ro);
-                auto ss = be16r(buffer, ro);
-                o += 12;
-
-                // dump sample
-                LOG_NFO(
-                    "sample: %02d%02d/%02d/%02d %02d:%02d => (mg/dL=%2d, mmol/L=%7.3f, status=0x%02x)",
-                    cc,
-                    yy,
-                    mm,
-                    dd,
-                    hh,
-                    mn,
-                    vv,
-                    (vv / 18.0),
-                    ss
-                );
-
-                // compute epoch
-                struct tm t;
-                memset(&t, 0, sizeof(t));
-                t.tm_min = mn;
-                t.tm_hour = hh;
-                t.tm_mday = dd;
-                t.tm_mon = (mm-1);
-                t.tm_year = ((cc*100 + yy) - 1900);
-                //auto epoch = timegm(&t);
-                auto epoch = timelocal(&t);
-
-                // write sample as JSON
-                if(0==ss) {
-                    fprintf(
-                        g_output,
-                        "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f }",
-                        (g_firstLine ? "" : ","),
-                        (int)(g_lineCount++),
-                        (uint64_t)epoch,
-                        (int)cc,
-                        (int)yy,
-                        (int)mm,
-                        (int)dd,
-                        (int)hh,
-                        (int)mn,
-                        (int)vv,
-                        (vv / 18.0)
-                    );
-                    g_firstLine = false;
-                }
-            }
-        };
-
-        // parse received data segment
-        parseData();
-
-        // send "data received" ack
+        // protocol step: start request for data segments
         {
             auto p = buffer;
             memset(buffer, 0, sizeof(buffer));
             be16(p, kAPDU_TYPE_PRESENTATION_APDU); // msg type
-            be16(p,     30);                       // length
-            be16(p,     28);                       // octet stringlength
-            be16(p, invokeId);                     // invoke-id from prev answer
-            be16(p, kDATA_ADPU_RESPONSE_CONFIRMED_EVENT_REPORT);
-            be16(p,     22);                       // length of what follows (could also be zero)
+            be16(p,     16);                       // length
+            be16(p,     14);                       // octet stringlength
+            be16(p, (1+invokeId));                 // invoke-id from prev answer
+            be16(p, kDATA_ADPU_INVOKE_CONFIRMED_ACTION);
+            be16(p,      8);                       // length of what follows (could also be zero)
             be16(p, pmStoreHandle);                // store handle
-            be32(p, 0xFFFFFFFF);                   // relative time
-            be16(p, kEVENT_TYPE_MDC_NOTI_SEGMENT_DATA);
-            be16(p,     12);
-            be32(p,     u0);
-            be32(p,     u1);
-            be16(p,     u2);
-            be16(p, 0x0080);
+            be16(p, kACTION_TYPE_MDC_ACT_SEG_TRIG_XFER);
+            be16(p,      2);                       // length
+            be16(p, (uint16_t)segId);              // segment
 
             bulkOut(
-                "data segment received ACK",
+                "request segments",
                 (p-buffer)
             );
         }
 
-        // bail if segment was flagged as last one in the stream
-        if(0x40 & status) {
-            break;
+        // step: read segment stream header answer
+        {
+            auto bytesRead = bulkIn("segment headers", BUFFER_SIZE, true);
+            if(bytesRead < 0) {
+                LOG_WRN("no segment headers for segId=%d, skipping", segId);
+                continue;
+            }
+            updateInvokeId();
+
+            uint16_t dataResponse = 0;
+            if(22<=bytesRead) {
+                size_t o = 20;
+                dataResponse = be16r(buffer, o);
+            }
         }
+
+        int segIndex = 0;
+        while(true) {
+
+            // get data and update invokeId
+            auto bytesRead = bulkIn("data segment", BUFFER_SIZE, true);
+            if(bytesRead < 0) {
+                LOG_WRN("timeout waiting for data segment segId=%d, aborting this segment", segId);
+                break;
+            }
+            auto status = buffer[32];
+            updateInvokeId();
+
+            // fish some data we need to send back in the "confirm" message
+            size_t o = 22;
+            auto u0 = be32r(buffer, o);
+            auto u1 = be32r(buffer, o);
+            auto u2 = be16r(buffer, o);
+
+            // lambda to parse samples out of each segment
+            auto parseData = [&]() {
+
+                size_t o = 30;
+                auto nbEntries = be16r(buffer, o);
+                LOG_NFO("segment has %d entries", (int)nbEntries);
+                o -= 2;
+
+                // Parse tags from non-glucose segments using the meal record signature, record length = 10
+                if(segId != 0) {
+                    size_t payload_start = 30;
+                    size_t payload_end = (size_t)bytesRead;
+
+                    auto bcd_to_int = [](
+                        uint8_t x
+                    ) -> int {
+                        return ((x >> 4) * 10) + (x & 0x0F);
+                    };
+
+                    auto valid_bcd_timestamp = [&](
+                        size_t pos
+                    ) -> bool {
+                        if(pos + 6 >= payload_end) {
+                            return false;
+                        }
+                        if(buffer[pos] != 0x20) {
+                            return false;
+                        }
+                        auto yy_byte = buffer[pos + 1];
+                        if(!(0x20 <= yy_byte && yy_byte <= 0x30)) {
+                            return false;
+                        }
+                        int mo = bcd_to_int(buffer[pos + 2]);
+                        int da = bcd_to_int(buffer[pos + 3]);
+                        int hh = bcd_to_int(buffer[pos + 4]);
+                        int mi = bcd_to_int(buffer[pos + 5]);
+                        int ss = bcd_to_int(buffer[pos + 6]);
+                        if(mo < 1 || mo > 12) return false;
+                        if(da < 1 || da > 31) return false;
+                        if(hh < 0 || hh > 23) return false;
+                        if(mi < 0 || mi > 59) return false;
+                        if(ss < 0 || ss > 59) return false;
+                        return true;
+                    };
+
+                    // find first timestamp and walk fixed-size records (10 bytes)
+                    const int rec_len = 10;
+                    size_t start_offset = (size_t)-1;
+                    for(size_t i = payload_start; i + rec_len <= payload_end; ++i) {
+                        if(valid_bcd_timestamp(i)) {
+                            start_offset = i;
+                            break;
+                        }
+                    }
+
+                    if(start_offset != (size_t)-1) {
+                        for(size_t pos = start_offset; pos + rec_len <= payload_end; pos += rec_len) {
+                            if(!valid_bcd_timestamp(pos)) {
+                                break;
+                            }
+                            int year = 2000 + bcd_to_int(buffer[pos + 1]);
+                            int mo = bcd_to_int(buffer[pos + 2]);
+                            int da = bcd_to_int(buffer[pos + 3]);
+                            int hh = bcd_to_int(buffer[pos + 4]);
+                            int mi = bcd_to_int(buffer[pos + 5]);
+                            // meal record signature observed in CMeal segment
+                            if(buffer[pos + 7] != 0x00 || buffer[pos + 8] != 0x72) {
+                                continue;
+                            }
+
+                            uint8_t code = buffer[pos + 9];
+
+                            uint8_t tag = 0;
+                            switch(code) {
+                                case 0x4C: tag = 1; break; // Antes comida
+                                case 0x50: tag = 2; break; // Desp. Comida
+                                case 0x54: tag = 3; break; // En Ayunas
+                                case 0x74: tag = 4; break; // Al acostarse
+                                default:
+                                    if(code != 0x00) {
+                                        tag = 5; // Otro (unknown meal code)
+                                        LOG_WRN("Unknown meal code 0x%02X at %04d-%02d-%02d %02d:%02d", code, year, mo, da, hh, mi);
+                                    }
+                                    break;
+                            }
+
+                            if(tag > 0) {
+                                char tsKey[32];
+                                snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mo, da, hh, mi);
+                                if(globalTagMap.find(std::string(tsKey)) == globalTagMap.end()) {
+                                    globalTagMap[std::string(tsKey)] = tag;
+                                    LOG_NFO("Found tag code 0x%02X -> %d for timestamp %s", code, tag, tsKey);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Process glucose measurements only from segId=0 (glucose segment)
+                if(segId != 0) {
+                    return;
+                }
+
+                o = 30;
+                nbEntries = be16r(buffer, o);
+                o -= 2;
+                for(int i=0; i<nbEntries; ++i) {
+
+                    // decode weird-ass encoding of datetime values
+                    auto cvt = [](
+                        uint8_t x
+                    ) {
+                        int v = -1;
+                        char buf[8];
+                        sprintf(buf, "%02X", x);
+                        sscanf(buf, "%d", &v);
+                        return v;
+                    };
+
+                    // load date
+                    auto cc = cvt(buffer[ 6 + o]);
+                    auto yy = cvt(buffer[ 7 + o]);
+                    auto mm = cvt(buffer[ 8 + o]);
+                    auto dd = cvt(buffer[ 9 + o]);
+                    auto hh = cvt(buffer[10 + o]);
+                    auto mn = cvt(buffer[11 + o]);
+
+                    // load value and status
+                    auto ro = (14 + o);
+                    auto vv = be16r(buffer, ro);
+                    auto ss = be16r(buffer, ro);
+
+                    o += 12;
+
+                    if(vv < 20 || vv > 600) {
+                        continue;
+                    }
+
+                    // dump sample
+                    LOG_NFO(
+                        "sample: %02d%02d/%02d/%02d %02d:%02d => (mg/dL=%2d, mmol/L=%7.3f, status=0x%02x)",
+                        cc,
+                        yy,
+                        mm,
+                        dd,
+                        hh,
+                        mn,
+                        vv,
+                        (vv / 18.0),
+                        ss
+                    );
+
+                    // compute epoch
+                    struct tm t;
+                    memset(&t, 0, sizeof(t));
+                    t.tm_min = mn;
+                    t.tm_hour = hh;
+                    t.tm_mday = dd;
+                    t.tm_mon = (mm-1);
+                    t.tm_year = ((cc*100 + yy) - 1900);
+                    auto epoch = timelocal(&t);
+
+                    if(0==ss) {
+                        measurements.push_back(
+                            Measurement{
+                                cc,
+                                yy,
+                                mm,
+                                dd,
+                                hh,
+                                mn,
+                                (int)vv,
+                                (uint16_t)ss,
+                                (uint64_t)epoch
+                            }
+                        );
+                    }
+                }
+            };
+
+            // parse received data segment
+            parseData();
+            segIndex++;
+
+            // send "data received" ack
+            {
+                auto p = buffer;
+                memset(buffer, 0, sizeof(buffer));
+                be16(p, kAPDU_TYPE_PRESENTATION_APDU); // msg type
+                be16(p,     30);                       // length
+                be16(p,     28);                       // octet stringlength
+                be16(p, invokeId);                     // invoke-id from prev answer
+                be16(p, kDATA_ADPU_RESPONSE_CONFIRMED_EVENT_REPORT);
+                be16(p,     22);                       // length of what follows (could also be zero)
+                be16(p, pmStoreHandle);                // store handle
+                be32(p, 0xFFFFFFFF);                   // relative time
+                be16(p, kEVENT_TYPE_MDC_NOTI_SEGMENT_DATA);
+                be16(p,     12);
+                be32(p,     u0);
+                be32(p,     u1);
+                be16(p,     u2);
+                be16(p, 0x0080);
+
+                bulkOut(
+                    "data segment received ACK",
+                    (p-buffer)
+                );
+            }
+
+            // bail if segment was flagged as last one in the stream
+            if(0x40 & status) {
+                break;
+            }
+        }
+    }
+
+    // write samples as JSON (after all segments so tags are collected)
+    for(const auto& m : measurements) {
+        int year = 2000 + m.yy;
+        char tsKey[32];
+        snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, m.mm, m.dd, m.hh, m.mn);
+        uint8_t tag = 0;
+        auto it = globalTagMap.find(std::string(tsKey));
+        if(it != globalTagMap.end()) {
+            tag = it->second;
+        }
+
+        if(tag > 0 && tag <= 5) {
+            fprintf(
+                g_output,
+                "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f, \"tag\":\"%s\" }",
+                (g_firstLine ? "" : ","),
+                (int)(g_lineCount++),
+                (uint64_t)m.epoch,
+                (int)m.cc,
+                (int)m.yy,
+                (int)m.mm,
+                (int)m.dd,
+                (int)m.hh,
+                (int)m.mn,
+                (int)m.vv,
+                (m.vv / 18.0),
+                getTagDesc(tag)
+            );
+        } else {
+            fprintf(
+                g_output,
+                "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f }",
+                (g_firstLine ? "" : ","),
+                (int)(g_lineCount++),
+                (uint64_t)m.epoch,
+                (int)m.cc,
+                (int)m.yy,
+                (int)m.mm,
+                (int)m.dd,
+                (int)m.hh,
+                (int)m.mn,
+                (int)m.vv,
+                (m.vv / 18.0)
+            );
+        }
+        g_firstLine = false;
     }
 
     // protocol step: disconnect cleanly from device
@@ -1581,12 +1758,51 @@ int main(
     char *argv[]
 ) {
 
-    // must be root
+    // Running as non-root is OK if udev permissions allow access to the USB device.
     auto euid = geteuid();
-    LOG_FTL(0!=euid, "must be root, euid is %d, bailing", euid);
+    if (euid != 0) {
+        LOG_NFO("running as non-root (euid=%d); relying on udev permissions", euid);
+    }
 
     // load config file
-    loadConfig();
+    if(const char* env = getenv("ACCUCHEK_CONFIG")) {
+        loadConfigFromPath(env);
+    } else {
+        loadConfigFromPath("config.txt");
+        if(g_config.empty() && argv[0] && strchr(argv[0], '/')) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s", argv[0]);
+            char* slash = strrchr(path, '/');
+            if(slash) {
+                *slash = '\0';
+                const char* suffix = "/config.txt";
+                size_t need = strlen(path) + strlen(suffix) + 1;
+                if(need <= PATH_MAX) {
+                    char cfg[PATH_MAX];
+                    snprintf(cfg, sizeof(cfg), "%s%s", path, suffix);
+                    loadConfigFromPath(cfg);
+                }
+            }
+        }
+        if(g_config.empty()) {
+            char exePath[PATH_MAX];
+            ssize_t n = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+            if(n > 0) {
+                exePath[n] = '\0';
+                char* slash = strrchr(exePath, '/');
+                if(slash) {
+                    *slash = '\0';
+                    const char* suffix = "/config.txt";
+                    size_t need = strlen(exePath) + strlen(suffix) + 1;
+                    if(need <= PATH_MAX) {
+                        char cfg[PATH_MAX];
+                        snprintf(cfg, sizeof(cfg), "%s%s", exePath, suffix);
+                        loadConfigFromPath(cfg);
+                    }
+                }
+            }
+        }
+    }
 
     // be silent unless asked to talk
     if(0!=getenv("ACCUCHEK_DBG")) {
@@ -1626,4 +1842,3 @@ int main(
     LOG_NFO("done");
     return 0;
 }
-
